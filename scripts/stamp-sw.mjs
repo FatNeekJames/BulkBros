@@ -1,0 +1,15 @@
+import {readFileSync,writeFileSync,readdirSync} from 'node:fs';
+import {createHash} from 'node:crypto';
+import {config} from 'dotenv';
+config({path:'.env.local'});
+const brand=process.env.VITE_APP_NAME||'BulkBro';
+const html=readFileSync('dist/index.html','utf8').replace('<title>BulkBro — Eat. Lift. Grow.</title>',`<title>${brand.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')} — Eat. Lift. Grow.</title>`);
+writeFileSync('dist/index.html',html);
+const manifest=JSON.parse(readFileSync('dist/manifest.webmanifest','utf8'));
+manifest.name=brand;manifest.short_name=brand;
+writeFileSync('dist/manifest.webmanifest',JSON.stringify(manifest));
+const assets=['/','/icon.svg','/brand.png','/manifest.webmanifest',...readdirSync('dist/assets').map(name=>'/assets/'+name)];
+const version=createHash('sha256').update(assets.join('|')).digest('hex').slice(0,12);
+const template=readFileSync('public/sw.js','utf8');
+writeFileSync('dist/sw.js',template.replace('__CACHE_VERSION__',JSON.stringify('bulkbro-shell-'+version)).replace('__PRE_CACHE__',JSON.stringify(assets)));
+console.log(`Service worker: ${assets.length} same-origin assets precached`);
