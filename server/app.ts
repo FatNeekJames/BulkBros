@@ -17,16 +17,15 @@ import {
   profileSchema,
   foodSchema,
   logSchema,
+  logBatchSchema,
+  savedMealSchema,
   workoutSchema,
   dateSchema,
-  macroCalories,
   workoutEnergy,
-  type Profile,
   type Snapshot,
 } from "../shared/domain";
-import { searchFoods, barcodeFood } from "./nutrition";
-import { recognizeMeal, coach } from "./ai";
-import { classifyAiError } from "./ai-errors";
+import { barcodeFood } from "./nutrition";
+import { sanitizeForwarding, trustLocalProxy } from "./request-security";
 const scrypt = promisify(scryptCallback),
   hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const credentials = z.object({
@@ -38,14 +37,25 @@ const credentials = z.object({
   password: z.string().min(12).max(128),
 });
 function allowedOrigin(origin: string): boolean {
-  if (origin === (process.env.APP_ORIGIN || "http://localhost:5188")) return true;
+  if (origin === (process.env.APP_ORIGIN || "http://localhost:5188"))
+    return true;
   if (process.env.NODE_ENV === "production") return false;
   try {
     const url = new URL(origin);
-    if (url.protocol !== "http:" || url.port !== "5191" || url.pathname !== "/") return false;
-    const addresses = Object.values(networkInterfaces()).flatMap((items) => items || []);
-    return addresses.some((address) => address.family === "IPv4" && !address.internal && address.address === url.hostname);
-  } catch { return false; }
+    if (url.protocol !== "http:" || url.port !== "5191" || url.pathname !== "/")
+      return false;
+    const addresses = Object.values(networkInterfaces()).flatMap(
+      (items) => items || [],
+    );
+    return addresses.some(
+      (address) =>
+        address.family === "IPv4" &&
+        !address.internal &&
+        address.address === url.hostname,
+    );
+  } catch {
+    return false;
+  }
 }
 async function passwordHash(password: string) {
   const salt = randomBytes(16).toString("hex"),
@@ -60,6 +70,8 @@ async function passwordValid(password: string, stored: string) {
 export function createApp(db: DB) {
   const app = express();
   app.disable("x-powered-by");
+  app.set("trust proxy", trustLocalProxy);
+  app.use(sanitizeForwarding);
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -76,17 +88,19 @@ export function createApp(db: DB) {
       },
     }),
   );
-  app.use(express.json({ limit: "8mb" }));
   app.use(cookieParser());
-  app.use(
-    "/api",
-    rateLimit({
-      windowMs: 60000,
-      limit: 300,
-      standardHeaders: "draft-8",
-      legacyHeaders: false,
-    }),
-  );
+  const healthLimit = rateLimit({
+    windowMs: 60000,
+    limit: 60,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+  });
+  const unauthenticatedLimit = rateLimit({
+    windowMs: 60000,
+    limit: 300,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+  });
   app.use("/api", (req, res, next) => {
     if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
       if (req.headers["x-bulkbro-client"] !== "1")
@@ -119,8 +133,9 @@ export function createApp(db: DB) {
       path: "/",
     });
   };
-  app.get("/api/health", (_req, res) => res.json({ ok: true }));
-  app.post("/api/auth/register", authLimit, async (req, res) => {
+  app.get("/api/health", healthLimit, (_req, res) => res.json({ ok: true }));
+  const authJson = express.json({ limit: "4kb" });
+  app.post("/api/auth/register", authLimit, authJson, async (req, res) => {
     const { email, password } = credentials.parse(req.body),
       id = randomUUID();
     const encoded = await passwordHash(password);
@@ -139,7 +154,7 @@ export function createApp(db: DB) {
     issueSession(res, id);
     res.status(201).json({ id, email });
   });
-  app.post("/api/auth/login", authLimit, async (req, res) => {
+  app.post("/api/auth/login", authLimit, authJson, async (req, res) => {
     const { email, password } = credentials.parse(req.body);
     const row = db.prepare("SELECT * FROM users WHERE email=?").get(email) as
       { id: string; password: string } | undefined;
@@ -158,11 +173,41 @@ export function createApp(db: DB) {
             .prepare("SELECT user_id FROM sessions WHERE hash=? AND expires>?")
             .get(hash(token), Date.now()) as { user_id: string } | undefined)
         : undefined;
-    if (!session) return res.status(401).json({ error: "Please sign in" });
+    if (!session)
+      return unauthenticatedLimit(req, res, () => {
+        res.status(401).json({ error: "Please sign in" });
+      });
     res.locals.userId = session.user_id;
     res.set("Cache-Control", "no-store");
     next();
   });
+  app.use(
+    "/api",
+    rateLimit({
+      windowMs: 60000,
+      limit: 300,
+      keyGenerator: (_req, res) => res.locals.userId,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+    }),
+  );
+  app.use("/api", (req, res, next) => {
+    if (
+      req.headers["x-bulkbro-user"] &&
+      req.headers["x-bulkbro-user"] !== res.locals.userId
+    )
+      return res.status(409).json({
+        error:
+          "The signed-in account changed. Sign in to the original account to sync its entries.",
+        code: "ACCOUNT_CHANGED",
+      });
+    next();
+  });
+  // Limit bodies before parsing; larger allowances cover only bounded batches.
+  app.post("/api/logs", express.json({ limit: "256kb" }));
+  app.post("/api/workouts", express.json({ limit: "128kb" }));
+  app.post("/api/saved-meals", express.json({ limit: "384kb" }));
+  app.use("/api", express.json({ limit: "16kb" }));
   function snapshot(id: string): Snapshot {
     const payloads = (table: string) =>
       db
@@ -206,14 +251,9 @@ export function createApp(db: DB) {
   });
   app.put("/api/profile", (req, res) => {
     const p = profileSchema.parse(req.body);
-    if (
-      p.targets &&
-      (p.targets.calories < 1200 ||
-        Math.abs(macroCalories(p.targets) - p.targets.calories) > 2)
-    )
+    if (p.targets && p.targets.calories <= 0)
       return res.status(400).json({
-        error:
-          "Targets must be at least 1,200 kcal and match macro energy (4/4/9).",
+        error: "Choose a calorie target greater than zero.",
       });
     try {
       db.prepare(
@@ -224,20 +264,24 @@ export function createApp(db: DB) {
     }
     res.json(p);
   });
-  app.get("/api/foods/search", async (req, res) => {
-    const q = z.string().min(2).max(100).parse(req.query.q);
-    const own = snapshot(res.locals.userId).foods.filter((f) =>
-      (f.name + " " + f.brand).toLowerCase().includes(q.toLowerCase()),
+  app.get("/api/foods/search", (req, res) => {
+    const q = z
+      .string()
+      .trim()
+      .min(1)
+      .max(100)
+      .parse(req.query.q)
+      .toLowerCase();
+    const own = snapshot(res.locals.userId);
+    const matches = [...own.foods, ...own.logs.slice().reverse()].filter((f) =>
+      (f.name + " " + f.brand).toLowerCase().includes(q),
     );
-    try {
-      res.json({ foods: [...own, ...(await searchFoods(q))], warning: null });
-    } catch {
-      res.json({
-        foods: own,
-        warning:
-          "Food database unavailable. Your saved foods are still available; use manual entry for anything else.",
-      });
+    const unique = new Map<string, (typeof matches)[number]>();
+    for (const food of matches) {
+      const key = `${food.name.toLowerCase()}|${food.brand.toLowerCase()}`;
+      if (!unique.has(key)) unique.set(key, food);
     }
+    res.json({ foods: [...unique.values()].slice(0, 50), warning: null });
   });
   app.get("/api/foods/barcode/:code", async (req, res) => {
     const code = z
@@ -265,6 +309,13 @@ export function createApp(db: DB) {
   app.put("/api/favourites/:id", (req, res) => {
     const id = z.string().max(100).parse(req.params.id);
     const { active } = z.object({ active: z.boolean() }).parse(req.body);
+    if (active) {
+      const own = snapshot(res.locals.userId);
+      if (![...own.foods, ...own.logs].some((food) => food.id === id))
+        return res
+          .status(404)
+          .json({ error: "Save this food to your account first." });
+    }
     if (active)
       db.prepare("INSERT OR IGNORE INTO favourites VALUES(?,?)").run(
         res.locals.userId,
@@ -278,7 +329,7 @@ export function createApp(db: DB) {
     res.json({ ok: true });
   });
   app.post("/api/logs", (req, res) => {
-    const logs = z.array(logSchema).min(1).max(50).parse(req.body);
+    const logs = logBatchSchema.parse(req.body);
     for (const l of logs) {
       if (
         l.analysisId &&
@@ -325,6 +376,45 @@ export function createApp(db: DB) {
       String(req.params.id),
       res.locals.userId,
     );
+    res.json({ ok: true });
+  });
+  app.put("/api/logs/:id", (req, res) => {
+    const log = logSchema.parse(req.body);
+    if (log.id !== req.params.id)
+      return res
+        .status(400)
+        .json({ error: "Entry identifier does not match." });
+    if (
+      log.analysisId &&
+      !db
+        .prepare("SELECT id FROM analyses WHERE id=? AND user_id=?")
+        .get(log.analysisId, res.locals.userId)
+    )
+      return res.status(403).json({ error: "Analysis unavailable" });
+    const result = db
+      .prepare(
+        "UPDATE food_logs SET date=?,meal=?,analysis_id=?,payload=? WHERE id=? AND user_id=?",
+      )
+      .run(
+        log.date,
+        log.meal,
+        log.analysisId ?? null,
+        JSON.stringify(log),
+        log.id,
+        res.locals.userId,
+      );
+    if (!result.changes)
+      return res.status(404).json({
+        error: "This entry is no longer available. Refresh your diary.",
+      });
+    res.json(log);
+  });
+  app.delete("/api/logs", (req, res) => {
+    const date = dateSchema.parse(req.query.date);
+    const meal = z.string().trim().min(1).max(40).parse(req.query.meal);
+    db.prepare(
+      "DELETE FROM food_logs WHERE user_id=? AND date=? AND meal=?",
+    ).run(res.locals.userId, date, meal);
     res.json({ ok: true });
   });
   app.post("/api/weights", (req, res) => {
@@ -393,14 +483,15 @@ export function createApp(db: DB) {
     res.status(201).json({ ok: true });
   });
   app.post("/api/saved-meals", (req, res) => {
-    const m = z
-      .object({
-        id: z.string().uuid(),
-        name: z.string().trim().min(1).max(100),
-        servings: z.number().min(0.1).max(1000),
-        ingredients: z.array(foodSchema).min(1).max(100),
-      })
-      .parse(req.body);
+    const m = savedMealSchema.parse(req.body);
+    const existing = db
+      .prepare("SELECT user_id FROM saved_meals WHERE id=?")
+      .get(m.id);
+    if (existing) {
+      if (existing.user_id !== res.locals.userId)
+        return res.status(409).json({ error: "Conflicting entry identifier" });
+      return res.json({ ok: true });
+    }
     db.prepare("INSERT INTO saved_meals VALUES(?,?,?)").run(
       m.id,
       res.locals.userId,
@@ -408,47 +499,12 @@ export function createApp(db: DB) {
     );
     res.status(201).json({ ok: true });
   });
-  const aiLimit = rateLimit({
-    windowMs: 3600000,
-    limit: 20,
-    keyGenerator: (_req, res) => res.locals.userId,
-    standardHeaders: "draft-8",
-    legacyHeaders: false,
-    handler: (_req, res) =>
-      res
-        .status(429)
-        .json({
-          code: "AI_RATE_LIMIT",
-          error:
-            "You have reached the hourly AI request limit. Please try again later.",
-        }),
-  });
-  app.post("/api/ai/meal", aiLimit, async (req, res) => {
-    const { image, notes } = z
-      .object({
-        image: z
-          .string()
-          .max(7500000)
-          .regex(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/),
-        notes: z.string().max(1000).default(""),
-      })
-      .parse(req.body);
-    const original = await recognizeMeal(image, notes),
-      id = randomUUID();
-    db.prepare("INSERT INTO analyses VALUES(?,?,?,?,?)").run(
-      id,
-      res.locals.userId,
-      JSON.stringify(original),
-      null,
-      new Date().toISOString(),
-    );
-    res.json({ id, ...original });
-  });
-  app.post("/api/ai/coach", aiLimit, async (req, res) => {
-    const { question } = z
-      .object({ question: z.string().trim().min(1).max(1000) })
-      .parse(req.body);
-    res.json({ answer: await coach(snapshot(res.locals.userId), question) });
+  app.post(["/api/ai/meal", "/api/ai/coach"], (_req, res) => {
+    res.status(410).json({
+      code: "AI_DEFERRED",
+      error:
+        "AI scanning and coaching are deferred. Use manual food logging; no AI credits are required.",
+    });
   });
   app.get("/api/account/export", (_req, res) => {
     const data = snapshot(res.locals.userId),
@@ -486,19 +542,20 @@ export function createApp(db: DB) {
       if (error instanceof z.ZodError)
         return res.status(400).json({
           error: error.issues
-            .map((i) => `${i.path.join(".")}: ${i.message}`)
-            .join("; "),
+            .slice(0, 5)
+            .map((i) => `${i.path.join(".")}: ${i.message.slice(0, 160)}`)
+            .join("; ")
+            .slice(0, 1000),
         });
-      const aiError = classifyAiError(error);
-      if (aiError)
-        return res
-          .status(aiError.status)
-          .json({ code: aiError.code, error: aiError.message });
       const e = error as { status?: number; type?: string };
       if (e.type === "entity.too.large")
+        return res.status(413).json({
+          error: "Request is too large. Submit fewer entries at a time.",
+        });
+      if (e.type === "entity.parse.failed")
         return res
-          .status(413)
-          .json({ error: "Image is too large. Choose an image under 5 MB." });
+          .status(400)
+          .json({ error: "Request must contain valid JSON." });
       res.status(503).json({
         error:
           "This service is temporarily unavailable. Your existing data is safe. Please try again.",

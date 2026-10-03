@@ -1,4 +1,20 @@
 import { z } from "zod";
+function boundedArray<T extends z.ZodTypeAny>(item: T, maximum: number) {
+  return z.preprocess((value, context) => {
+    // Zod's array .max() records an issue but still parses every child.
+    if (Array.isArray(value) && value.length > maximum) {
+      context.addIssue({
+        code: z.ZodIssueCode.too_big,
+        type: "array",
+        maximum,
+        inclusive: true,
+        fatal: true,
+      });
+      return z.NEVER;
+    }
+    return value;
+  }, z.array(item).min(1).max(maximum));
+}
 export const dateSchema = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -50,6 +66,13 @@ export const logSchema = foodSchema.extend({
   analysisId: z.string().uuid().optional(),
 });
 export type FoodLog = z.infer<typeof logSchema>;
+export const logBatchSchema = boundedArray(logSchema, 50);
+export const savedMealSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().trim().min(1).max(100),
+  servings: z.number().finite().min(0.1).max(1000),
+  ingredients: boundedArray(foodSchema, 100),
+});
 export const setSchema = z.object({
   weight: number(0, 1500),
   reps: number(1, 1000).int(),
@@ -61,15 +84,13 @@ export const workoutSchema = z.object({
   name: z.string().trim().min(1).max(100),
   duration: number(1, 600),
   intensity: z.enum(["light", "moderate", "vigorous"]),
-  exercises: z
-    .array(
-      z.object({
-        name: z.string().trim().min(1).max(100),
-        sets: z.array(setSchema).min(1).max(30),
-      }),
-    )
-    .min(1)
-    .max(40),
+  exercises: boundedArray(
+    z.object({
+      name: z.string().trim().min(1).max(100),
+      sets: boundedArray(setSchema, 30),
+    }),
+    40,
+  ),
 });
 export type Workout = z.infer<typeof workoutSchema> & { calories?: number };
 export type WeightEntry = { id: string; date: string; weight: number };
@@ -176,23 +197,64 @@ export function workoutEnergy(
       minutes,
   );
 }
-export function localDate(d = new Date()) {
+export function currentTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+export function localDate(d = new Date(), timeZone?: string) {
+  if (timeZone) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(d);
+    const part = (name: string) => parts.find((p) => p.type === name)!.value;
+    return `${part("year")}-${part("month")}-${part("day")}`;
+  }
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 export function offsetDate(date: string, n: number) {
-  const d = new Date(date + "T12:00:00");
-  d.setDate(d.getDate() + n);
-  return localDate(d);
+  // Calendar arithmetic must not gain or lose a day across DST or travel.
+  const d = new Date(date + "T12:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
 }
-export function streak(dates: string[], today = localDate()) {
-  const days = new Set(dates);
+/**
+ * One saved food on a calendar date completes that day, regardless of targets.
+ * An unfinished today keeps yesterday's run alive until the next local midnight.
+ * Backfills and deletions recalculate both runs from the remaining saved dates;
+ * deleting a day's only food removes that day. Future dates never count.
+ * Date keys remain as logged when the device timezone changes; only "today"
+ * changes. No streak counters or sample dates are persisted separately.
+ */
+export function mealStreak(dates: string[], today = localDate()) {
+  dateSchema.parse(today);
+  const days = new Set(
+    dates.filter((date) => date <= today && dateSchema.safeParse(date).success),
+  );
   let day = days.has(today) ? today : offsetDate(today, -1),
-    count = 0;
+    current = 0;
   while (days.has(day)) {
-    count++;
+    current++;
     day = offsetDate(day, -1);
   }
-  return count;
+  let best = 0,
+    run = 0,
+    previous: string | undefined;
+  for (const date of [...days].sort()) {
+    run = previous && offsetDate(previous, 1) === date ? run + 1 : 1;
+    best = Math.max(best, run);
+    previous = date;
+  }
+  return {
+    current,
+    best,
+    completedToday: days.has(today),
+    loggedDays: days.size,
+  };
+}
+export function streak(dates: string[], today = localDate()) {
+  return mealStreak(dates, today).current;
 }
 export function rollingWeights(entries: WeightEntry[]) {
   const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
@@ -260,20 +322,23 @@ export function personalRecords(workouts: Workout[]) {
   }
   return records;
 }
-export function achievements(s: Snapshot) {
-  const ls = streak(s.logs.map((l) => l.date)),
+export function achievements(s: Snapshot, today = localDate()) {
+  const ls = mealStreak(
+      s.logs.map((l) => l.date),
+      today,
+    ),
     prs = personalRecords(s.workouts);
   return [
     {
       title: "First fuel",
       description: "Log your first meal",
-      value: s.logs.length,
+      value: ls.loggedDays,
       target: 1,
     },
     {
       title: "Building the habit",
       description: "Log food for 7 consecutive days",
-      value: ls,
+      value: ls.best,
       target: 7,
     },
     {

@@ -31,6 +31,7 @@ test("account to daily tracking, persistent reload and mobile layout", async ({
   await page.getByLabel("fat (g)", { exact: true }).fill("8");
   await page.getByRole("button", { name: "Add to meal", exact: true }).click();
   await page.getByRole("button", { name: "Log meal", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByText("Test oats", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Weigh in", exact: true }).click();
   await page.getByLabel("Weight (kg)", { exact: true }).fill("80.2");
@@ -52,7 +53,7 @@ test("account to daily tracking, persistent reload and mobile layout", async ({
   await page.screenshot({
     path: "test-results/dashboard-desktop.png",
     fullPage: true,
-    animations: 'disabled',
+    animations: "disabled",
   });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("heading", { name: "Daily fuel" })).toBeVisible();
@@ -64,8 +65,11 @@ test("account to daily tracking, persistent reload and mobile layout", async ({
   await page.screenshot({
     path: "test-results/dashboard-mobile.png",
     fullPage: true,
-    animations: 'disabled',
+    animations: "disabled",
   });
   expect(errors).toEqual([]);
-  await page.request.delete('/api/account',{headers:{'X-Bulkbro-Client':'1'},data:{password:'a-strong-test-password'}});
+  await page.request.delete("/api/account", {
+    headers: { "X-Bulkbro-Client": "1" },
+    data: { password: "a-strong-test-password" },
+  });
 });

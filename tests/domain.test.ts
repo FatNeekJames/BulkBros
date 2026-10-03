@@ -7,18 +7,27 @@ import {
   volume,
   workoutEnergy,
   streak,
+  mealStreak,
+  localDate,
+  offsetDate,
+  achievements,
   rollingWeights,
   personalRecords,
   profileSchema,
   dateSchema,
+  logBatchSchema,
+  savedMealSchema,
+  workoutSchema,
   type Profile,
   type Food,
   type Workout,
+  type Snapshot,
 } from "../shared/domain";
 import { parseProduct } from "../server/nutrition";
 import { recognitionSchema } from "../server/ai";
 import { classifyAiError } from "../server/ai-errors";
 import { newId } from "../src/id";
+import { z } from "zod";
 const profile: Profile = {
   name: "Test",
   username: "test_user",
@@ -208,6 +217,118 @@ describe("training and progress", () => {
     ).toBe(true);
   });
 });
+describe("meal-day streaks", () => {
+  it("starts empty, counts a saved day once and ignores future/invalid dates", () => {
+    expect(mealStreak([], "2026-10-03")).toEqual({
+      current: 0,
+      best: 0,
+      completedToday: false,
+      loggedDays: 0,
+    });
+    expect(
+      mealStreak(
+        ["2026-10-03", "2026-10-03", "2026-10-04", "2026-02-30", "bad"],
+        "2026-10-03",
+      ),
+    ).toEqual({ current: 1, best: 1, completedToday: true, loggedDays: 1 });
+  });
+  it("keeps yesterday's streak until an entire local day is missed", () => {
+    const dates = ["2026-10-01", "2026-10-02"];
+    expect(mealStreak(dates, "2026-10-02")).toMatchObject({
+      current: 2,
+      completedToday: true,
+    });
+    expect(mealStreak(dates, "2026-10-03")).toMatchObject({
+      current: 2,
+      completedToday: false,
+    });
+    expect(mealStreak(dates, "2026-10-04")).toMatchObject({
+      current: 0,
+      best: 2,
+    });
+  });
+  it("joins a gap on backfill and removes a day only when its final food is deleted", () => {
+    const dates = ["2026-10-01", "2026-10-03", "2026-10-03"];
+    expect(mealStreak(dates, "2026-10-03").current).toBe(1);
+    const backfilled = [...dates, "2026-10-02"];
+    expect(mealStreak(backfilled, "2026-10-03")).toMatchObject({
+      current: 3,
+      best: 3,
+    });
+    expect(mealStreak(backfilled.slice(1), "2026-10-03").current).toBe(2);
+    expect(
+      mealStreak(["2026-10-01", "2026-10-02", "2026-10-03"], "2026-10-03")
+        .current,
+    ).toBe(3);
+    expect(
+      mealStreak(["2026-10-01", "2026-10-03"], "2026-10-03"),
+    ).toMatchObject({
+      current: 1,
+      best: 1,
+    });
+  });
+  it("retains the best historical run after a missed day", () => {
+    expect(
+      mealStreak(
+        ["2026-09-29", "2026-09-27", "2026-09-28", "2026-10-03"],
+        "2026-10-03",
+      ),
+    ).toMatchObject({ current: 1, best: 3 });
+  });
+  it("rolls over at local midnight and changes only today's boundary after travel", () => {
+    const dates = ["2026-10-01", "2026-10-02"];
+    const instant = new Date("2026-10-03T23:00:00Z");
+    expect(localDate(instant, "Europe/London")).toBe("2026-10-04");
+    expect(localDate(instant, "America/Los_Angeles")).toBe("2026-10-03");
+    expect(mealStreak(dates, localDate(instant, "Europe/London")).current).toBe(
+      0,
+    );
+    expect(
+      mealStreak(dates, localDate(instant, "America/Los_Angeles")).current,
+    ).toBe(2);
+    expect(dates).toEqual(["2026-10-01", "2026-10-02"]);
+    const before = new Date("2026-10-03T22:59:59Z");
+    expect(mealStreak(dates, localDate(before, "Europe/London")).current).toBe(
+      2,
+    );
+  });
+  it("does calendar arithmetic across DST, leap days and year boundaries", () => {
+    expect(offsetDate("2026-03-29", 1)).toBe("2026-03-30");
+    expect(offsetDate("2026-10-25", -1)).toBe("2026-10-24");
+    expect(offsetDate("2024-03-01", -1)).toBe("2024-02-29");
+    expect(offsetDate("2026-01-01", -1)).toBe("2025-12-31");
+  });
+  it("keeps earned habit achievements after a gap and recalculates corrections", () => {
+    const snapshot: Snapshot = {
+      user: { id: "test", email: "test@example.test" },
+      profile,
+      foods: [],
+      logs: Array.from({ length: 7 }, (_, i) => ({
+        ...food,
+        id: crypto.randomUUID(),
+        date: offsetDate("2026-09-01", i),
+        meal: "Breakfast",
+      })),
+      workouts: [],
+      weights: [],
+      activity: [],
+      savedMeals: [],
+      favourites: [],
+    };
+    const habit = (s: Snapshot) =>
+      achievements(s, "2026-10-03").find(
+        (a) => a.title === "Building the habit",
+      );
+    expect(habit(snapshot)?.value).toBe(7);
+    expect(habit({ ...snapshot, logs: snapshot.logs.slice(1) })?.value).toBe(6);
+    expect(
+      achievements(
+        { ...snapshot, logs: [{ ...snapshot.logs[0], date: "2026-10-04" }] },
+        "2026-10-03",
+      ).find((a) => a.title === "First fuel")?.value,
+    ).toBe(0);
+  });
+});
 describe("AI service failures", () => {
   it("distinguishes exhausted credit from a temporary rate limit", () => {
     expect(
@@ -229,5 +350,99 @@ describe("LAN-safe identifiers", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(b).not.toBe(a);
+  });
+});
+
+describe("collection validation budgets", () => {
+  function unreadableItems(length: number) {
+    const items = new Array(length);
+    Object.defineProperty(items, 0, {
+      get() {
+        throw new Error("Oversized collections must not inspect their items");
+      },
+    });
+    return items;
+  }
+
+  it.each([
+    ["logs", () => logBatchSchema.safeParse(unreadableItems(51)), []],
+    [
+      "ingredients",
+      () =>
+        savedMealSchema.safeParse({
+          id: crypto.randomUUID(),
+          name: "Recipe",
+          servings: 1,
+          ingredients: unreadableItems(101),
+        }),
+      ["ingredients"],
+    ],
+    [
+      "exercises",
+      () =>
+        workoutSchema.safeParse({ ...workout, exercises: unreadableItems(41) }),
+      ["exercises"],
+    ],
+    [
+      "sets",
+      () =>
+        workoutSchema.safeParse({
+          ...workout,
+          exercises: [{ name: "Bench press", sets: unreadableItems(31) }],
+        }),
+      ["exercises", 0, "sets"],
+    ],
+  ] as const)(
+    "rejects excess %s before reading any item",
+    (_name, parse, path) => {
+      const result = parse();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues).toHaveLength(1);
+        expect(result.error.issues[0]).toMatchObject({ code: "too_big", path });
+      }
+    },
+  );
+
+  it("preserves maximum collections, defaults and extendable workout objects", () => {
+    const log = {
+      ...food,
+      id: crypto.randomUUID(),
+      date: "2026-09-20",
+      meal: "Lunch",
+    };
+    expect(
+      logBatchSchema.parse(Array.from({ length: 50 }, () => log)),
+    ).toHaveLength(50);
+    expect(
+      savedMealSchema.parse({
+        id: crypto.randomUUID(),
+        name: "Recipe",
+        servings: 1,
+        ingredients: Array.from({ length: 100 }, () => food),
+      }).ingredients,
+    ).toHaveLength(100);
+    const extended = workoutSchema.extend({ calories: z.number().optional() });
+    const result = extended.parse({
+      ...workout,
+      calories: 100,
+      exercises: Array.from({ length: 40 }, () => ({
+        name: "Bench press",
+        sets: Array.from({ length: 30 }, () => ({ weight: 80, reps: 8 })),
+      })),
+    });
+    expect(result.exercises).toHaveLength(40);
+    expect(result.exercises[0].sets).toHaveLength(30);
+    expect(result.calories).toBe(100);
+    expect(logBatchSchema.safeParse([]).success).toBe(false);
+    expect(workoutSchema.safeParse({ ...workout, exercises: [] }).success).toBe(
+      false,
+    );
+    expect(
+      workoutSchema.safeParse({
+        ...workout,
+        exercises: [{ name: "Bench press", sets: [] }],
+      }).success,
+    ).toBe(false);
   });
 });

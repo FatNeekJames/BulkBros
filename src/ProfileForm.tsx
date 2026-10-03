@@ -70,7 +70,7 @@ export function ProfileForm({
             carbs: (macro.calories * percent.carbs) / 400,
             fat: (macro.calories * percent.fat) / 900,
           };
-        } else p.targets = { ...macro, calories: macroCalories(macro) };
+        } else p.targets = { ...macro };
       }
       await onSave(profileSchema.parse(p));
     } catch (e) {
@@ -295,7 +295,7 @@ export function ProfileForm({
             </strong>
           </div>
           <div>
-            <small>Recommended target</small>
+            <small>Suggested target · estimate</small>
             <strong className="lime">
               {preview.recommended}
               <span> kcal</span>
@@ -339,11 +339,11 @@ export function ProfileForm({
               Percent of calories
             </button>
           </div>
-          {mode === "percent" && (
+          {
             <Field label="Calorie target">
               <input
                 type="number"
-                min={1200}
+                min={1}
                 max={10000}
                 value={macro.calories}
                 onChange={(e) =>
@@ -352,7 +352,7 @@ export function ProfileForm({
                 required
               />
             </Field>
-          )}
+          }
           <div className="form-grid three">
             {(["protein", "carbs", "fat"] as const).map((k) => (
               <Field
@@ -381,7 +381,7 @@ export function ProfileForm({
           </div>
           <p className="muted">
             {mode === "grams"
-              ? `${Math.round(macroCalories(macro))} kcal from macros (protein × 4 + carbs × 4 + fat × 9).`
+              ? `${Math.round(macroCalories(macro))} kcal from macros (4/4/9). Your calorie target remains independently editable.`
               : `${percent.protein + percent.carbs + percent.fat}% allocated. Must total 100%.`}
           </p>
         </>

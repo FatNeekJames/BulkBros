@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-test("meal scan explains exhausted credit and offers manual logging", async ({
+test("manual logging is available without AI or external food requests", async ({
   page,
 }) => {
   const suffix = Date.now(),
@@ -30,32 +30,31 @@ test("meal scan explains exhausted credit and offers manual logging", async ({
       exerciseCalories: false,
     },
   });
-  await page.route("**/api/ai/meal", (route) =>
-    route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({
-        code: "AI_CREDITS_EXHAUSTED",
-        error:
-          "AI features are unavailable because the connected OpenAI API project has no credit. Food logging and training tracking still work.",
-      }),
-    }),
-  );
-  await page.goto("/");
-  await page.getByRole("button", { name: "Food diary" }).click();
-  await page.getByRole("button", { name: "Scan meal", exact: true }).click();
-  await page.locator("input[type=file]").setInputFiles({
-    name: "meal.png",
-    mimeType: "image/png",
-    buffer: Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg==",
-      "base64",
-    ),
+  const externalRequests: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.url().includes("/api/ai/") ||
+      request.url().includes("/api/foods/search")
+    )
+      externalRequests.push(request.url());
   });
-  await page.getByRole("button", { name: "Analyse meal" }).click();
-  await expect(page.getByRole("alert")).toContainText("no credit");
-  await page.getByRole("button", { name: "Enter food manually" }).click();
+  await page.goto("/");
+  await page.getByRole("button", { name: "Food diary", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Scan meal", exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "Log food", exact: true }).click();
+  await page.getByRole("button", { name: "Manual", exact: true }).click();
   await expect(page.getByLabel("Food name", { exact: true })).toBeVisible();
+  await page.getByLabel("Food name", { exact: true }).fill("Manual test food");
+  await page.getByLabel("calories (kcal)", { exact: true }).fill("100");
+  await page.getByRole("button", { name: "Add to meal", exact: true }).click();
+  await page.getByRole("button", { name: "Log meal", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(
+    page.getByText("Manual test food", { exact: true }),
+  ).toBeVisible();
+  expect(externalRequests).toEqual([]);
   await page.request.delete("/api/account", {
     headers,
     data: { password: "a-strong-test-password" },

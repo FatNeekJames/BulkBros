@@ -1,4 +1,10 @@
-import { useState, useEffect, useCallback, type FormEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type FormEvent,
+} from "react";
 import {
   LayoutDashboard,
   Utensils,
@@ -13,21 +19,19 @@ import {
   ChevronRight,
   ArrowUpRight,
   ArrowRight,
-  ScanLine,
-  Camera,
   Scale,
   LogOut,
   WifiOff,
   Check,
   Target,
   Trophy,
-  Sparkles,
   Menu,
   X,
   Trash2,
   Copy,
   Bookmark,
   Download,
+  Pencil,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -49,19 +53,41 @@ import {
   enqueue,
   pending,
   syncQueue,
+  waitForSync,
+  retryPending,
+  discardPending,
+  pendingConflict,
   overlayPending,
+  storageWarning,
 } from "./api";
 import { Modal, Field, Progress, Empty, Stat } from "./components";
 import { FoodDialog } from "./FoodDialog";
 import { WorkoutDialog } from "./WorkoutDialog";
+import { EditFoodDialog, TargetsDialog } from "./DiaryDialogs";
 import { ProfileForm } from "./ProfileForm";
+import { QueueRecovery } from "./QueueRecovery";
 import { newId } from "./id";
+import {
+  accountLifetime,
+  accountBoundaryKey,
+  boundaryIsSignedIn,
+  beginAccountChange,
+  commitAccountBoundary,
+  isCurrentAccount,
+  requireAccountWork,
+  requireCurrentAccount,
+  startAccountLifetime,
+  StaleAccountError,
+  type AccountLifetime,
+} from "./accountLifecycle";
 import {
   calculateTargets,
   totals,
   localDate,
   offsetDate,
   streak,
+  mealStreak,
+  currentTimeZone,
   rollingWeights,
   volume,
   personalRecords,
@@ -73,7 +99,7 @@ import {
   type WeightEntry,
   type Activity,
 } from "../shared/domain";
-export const BRAND = import.meta.env.VITE_APP_NAME || "BulkBro";
+export const BRAND = import.meta.env.VITE_APP_NAME || "Bulk Bro";
 const nav = [
   { id: "home", label: "Overview", icon: LayoutDashboard },
   { id: "food", label: "Food diary", icon: Utensils },
@@ -81,42 +107,147 @@ const nav = [
   { id: "progress", label: "Progress", icon: ChartNoAxesCombined },
 ];
 const fmt = (n: number) => Math.round(n).toLocaleString();
-const mealNames = [
-  "Breakfast",
-  "Lunch",
-  "Dinner",
-  "Snacks",
-  "Pre-workout",
-  "Post-workout",
-];
+const mealNames = ["Breakfast", "Lunch", "Dinner", "Snacks"];
 type Dialog =
-  "food" | "workout" | "weight" | "activity" | "profile" | "coach" | null;
+  "food" | "workout" | "weight" | "activity" | "profile" | "targets" | null;
 export default function App() {
   const [data, setData] = useState<Snapshot | null>(null),
     [loading, setLoading] = useState(true),
     [page, setPage] = useState("home"),
     [date, setDate] = useState(localDate()),
+    [clockDay, setClockDay] = useState(localDate()),
+    [timezone, setTimezone] = useState(currentTimeZone()),
+    [editing, setEditing] = useState<FoodLog | null>(null),
+    [mutationBusy, setMutationBusy] = useState(false),
     [dialog, setDialog] = useState<Dialog>(null),
     [foodMode, setFoodMode] = useState("search"),
     [meal, setMeal] = useState("Breakfast"),
     [notice, setNotice] = useState(""),
     [offline, setOffline] = useState(!navigator.onLine),
-    [queued, setQueued] = useState(pending().length),
+    [queueItems, setQueueItems] = useState(pending),
+    [syncBusy, setSyncBusy] = useState(false),
     [mobileNav, setMobileNav] = useState(false);
-  const refresh = useCallback(async () => {
-    const s = overlayPending(await api<Snapshot>("/snapshot"));
-    setData(s);
-    cacheSnapshot(s);
-  }, []);
+  const recovering = useRef(false);
+  const refreshRevision = useRef(0);
+  const activeMutations = useRef(new Set<Promise<void>>());
+  const [renderedLifetime, setRenderedLifetime] = useState(accountLifetime);
+  const applySnapshot = useCallback(
+    (snapshot: Snapshot, lifetime: AccountLifetime) => {
+      requireAccountWork(lifetime);
+      if (lifetime.userId !== snapshot.user.id) {
+        lifetime = startAccountLifetime(snapshot.user.id, lifetime.boundary);
+        setRenderedLifetime(lifetime);
+        setDialog(null);
+        setEditing(null);
+        setPage("home");
+      }
+      const s = overlayPending(snapshot);
+      cacheSnapshot(s, lifetime);
+      setData(s);
+      setQueueItems(pending());
+      return lifetime;
+    },
+    [],
+  );
+  const refresh = useCallback(
+    async (lifetime = accountLifetime()) => {
+      requireAccountWork(lifetime);
+      if (recovering.current) return;
+      const revision = refreshRevision.current;
+      const snapshot = await api<Snapshot>(
+        "/snapshot",
+        "GET",
+        undefined,
+        undefined,
+        lifetime,
+      );
+      requireAccountWork(lifetime);
+      // A snapshot requested before recovery cannot overwrite its newer result.
+      if (!recovering.current && revision === refreshRevision.current)
+        return applySnapshot(snapshot, lifetime);
+    },
+    [applySnapshot],
+  );
+  // Child callbacks retain their originating lifetime across awaits and account switches.
+  const refreshRenderedAccount = () => refresh(renderedLifetime).then(() => {});
   useEffect(() => {
-    refresh()
+    const changed = (event: StorageEvent) => {
+      if (event.key !== accountBoundaryKey && event.key !== null) return;
+      if (isCurrentAccount(accountLifetime())) return;
+      // Peers adopt the marker without writing it or clearing another tab's new data.
+      const lifetime = startAccountLifetime();
+      setRenderedLifetime(lifetime);
+      refreshRevision.current += 1;
+      recovering.current = false;
+      activeMutations.current.clear();
+      setData(null);
+      setQueueItems([]);
+      setDialog(null);
+      setEditing(null);
+      setPage("home");
+      setNotice("");
+      setAuthError("");
+      setAuthBusy(false);
+      setSyncBusy(false);
+      setMutationBusy(false);
+      setLoading(false);
+      if (boundaryIsSignedIn()) {
+        void refresh(lifetime).catch((error) => {
+          if (
+            isCurrentAccount(lifetime) &&
+            !(error instanceof StaleAccountError)
+          )
+            setNotice(
+              "Your account changed in another tab. Sign in again or reload to continue.",
+            );
+        });
+      }
+    };
+    window.addEventListener("storage", changed);
+    return () => window.removeEventListener("storage", changed);
+  }, [refresh]);
+  useEffect(() => {
+    const tick = () => {
+      const next = localDate();
+      setClockDay((previous) => {
+        if (previous !== next)
+          setDate((selected) =>
+            selected === previous && !dialog && !editing ? next : selected,
+          );
+        return next;
+      });
+      setTimezone(currentTimeZone());
+    };
+    const timer = window.setInterval(tick, 1000);
+    window.addEventListener("focus", tick);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", tick);
+    };
+  }, [dialog, editing]);
+  useEffect(() => {
+    const lifetime = accountLifetime();
+    let completedLifetime = lifetime;
+    refresh(lifetime)
+      .then((applied) => {
+        if (applied) completedLifetime = applied;
+      })
       .catch((e) => {
+        if (!isCurrentAccount(lifetime) || e instanceof StaleAccountError)
+          return;
         if (e instanceof ApiError && e.status === 401) {
-          clearLocal();
+          try {
+            clearLocal();
+          } catch (error) {
+            setNotice((error as Error).message);
+          }
+          completedLifetime = accountLifetime();
+          setRenderedLifetime(completedLifetime);
           setData(null);
         } else {
           const saved = cachedSnapshot();
-          setData(saved);
+          if (saved) completedLifetime = applySnapshot(saved, lifetime);
+          else setData(null);
           setOffline(true);
           if (!saved)
             setNotice(
@@ -124,78 +255,237 @@ export default function App() {
             );
         }
       })
-      .finally(() => setLoading(false));
-  }, [refresh]);
+      .finally(() => {
+        if (isCurrentAccount(completedLifetime)) setLoading(false);
+      });
+  }, [refresh, applySnapshot]);
   useEffect(() => {
+    const lifetime = accountLifetime();
     if (
       data?.user.id &&
+      lifetime.userId === data.user.id &&
+      !lifetime.changing &&
+      !recovering.current &&
       navigator.onLine &&
       pending().some((p) => p.userId === data.user.id)
     ) {
-      syncQueue(data.user.id)
-        .then(refresh)
-        .then(() => setQueued(pending().length))
-        .catch((e) =>
-          setNotice(
-            "Your queued entries are saved on this device. Sync needs attention: " +
-              e.message,
-          ),
-        );
+      syncQueue(data.user.id, lifetime)
+        .then(() => refresh(lifetime))
+        .catch((e) => {
+          if (isCurrentAccount(lifetime))
+            setNotice(
+              "Your queued entries are saved on this device. Sync needs attention: " +
+                e.message,
+            );
+        })
+        .finally(() => {
+          if (isCurrentAccount(lifetime)) setQueueItems(pending());
+        });
     }
-  }, [data?.user.id, refresh]);
+  }, [data?.user.id, refresh, renderedLifetime]);
   useEffect(() => {
+    const lifetime = accountLifetime();
     const online = () => {
+      if (!isCurrentAccount(lifetime) || lifetime.changing) return;
       setOffline(false);
-      if (data)
-        syncQueue(data.user.id)
-          .then(refresh)
+      if (data && !recovering.current)
+        (pending().some((item) => item.userId === data.user.id)
+          ? syncQueue(data.user.id, lifetime)
+          : Promise.resolve()
+        )
+          .then(() => refresh(lifetime))
           .then(() => {
-            setQueued(pending().length);
-            setNotice("Your offline entries are synced.");
+            requireAccountWork(lifetime);
+            const remaining = pending().filter(
+              (item) => item.userId === data.user.id,
+            );
+            setNotice(
+              remaining.length
+                ? "Some changes need your attention. Other entries can still sync."
+                : "Your offline entries are synced.",
+            );
           })
-          .catch((e) => setNotice("Sync needs attention: " + e.message));
+          .catch((e) => {
+            if (isCurrentAccount(lifetime))
+              setNotice("Sync needs attention: " + e.message);
+          })
+          .finally(() => {
+            if (isCurrentAccount(lifetime)) setQueueItems(pending());
+          });
     };
-    const off = () => setOffline(true);
+    const off = () => {
+      if (isCurrentAccount(lifetime)) setOffline(true);
+    };
     window.addEventListener("online", online);
     window.addEventListener("offline", off);
     return () => {
       window.removeEventListener("online", online);
       window.removeEventListener("offline", off);
     };
-  }, [data?.user.id, refresh]);
+  }, [data?.user.id, refresh, renderedLifetime]);
   useEffect(() => {
     if (!notice) return;
     const t = setTimeout(() => setNotice(""), 7000);
     return () => clearTimeout(t);
   }, [notice]);
-  async function mutate(
+  async function recoverQueue(action: "retry" | "discard", id?: string) {
+    const lifetime = renderedLifetime;
+    requireAccountWork(lifetime);
+    if (!data || recovering.current) return;
+    // Lock synchronously, before any promise yields, so a new online event or
+    // save cannot start between draining writes and reading the baseline.
+    recovering.current = true;
+    refreshRevision.current += 1;
+    setSyncBusy(true);
+    setNotice("");
+    try {
+      await Promise.allSettled([...activeMutations.current]);
+      requireAccountWork(lifetime);
+      await waitForSync(data.user.id, lifetime);
+      if (action === "discard" && id) {
+        // Load the account first so discarding a local edit cannot leave an old
+        // optimistic copy visible if the server is unreachable.
+        const baseline = await api<Snapshot>(
+          "/snapshot",
+          "GET",
+          undefined,
+          data.user.id,
+          lifetime,
+        );
+        requireAccountWork(lifetime);
+        if (baseline.user.id !== data.user.id)
+          throw new Error(
+            "Your account changed. Reload before resolving changes.",
+          );
+        await discardPending(data.user.id, id, lifetime);
+        requireAccountWork(lifetime);
+        applySnapshot(baseline, lifetime);
+        setNotice(
+          "Selected local change discarded. Other queued changes are kept.",
+        );
+      } else {
+        if (id) await retryPending(data.user.id, id, lifetime);
+        else await syncQueue(data.user.id, lifetime);
+        requireAccountWork(lifetime);
+        const snapshot = await api<Snapshot>(
+          "/snapshot",
+          "GET",
+          undefined,
+          data.user.id,
+          lifetime,
+        );
+        applySnapshot(snapshot, lifetime);
+        setNotice(
+          pending().some((item) => item.userId === data.user.id)
+            ? "Some changes still need attention. Your local changes are kept."
+            : "Your offline entries are synced.",
+        );
+      }
+    } catch (e) {
+      if (isCurrentAccount(lifetime))
+        setNotice("Could not resolve this change: " + (e as Error).message);
+    } finally {
+      if (isCurrentAccount(lifetime)) {
+        setQueueItems(pending());
+        recovering.current = false;
+        setSyncBusy(false);
+      }
+    }
+  }
+  function mutate(
     path: string,
     body: unknown,
     method = "POST",
     optimistic?: (s: Snapshot) => Snapshot,
   ) {
+    if (recovering.current)
+      return Promise.reject(
+        new Error(
+          "A queued change is being resolved. Keep this form open and save again in a moment.",
+        ),
+      );
+    const operation = performMutation(path, body, method, optimistic);
+    activeMutations.current.add(operation);
+    return operation.finally(() => activeMutations.current.delete(operation));
+  }
+  async function performMutation(
+    path: string,
+    body: unknown,
+    method = "POST",
+    optimistic?: (s: Snapshot) => Snapshot,
+  ) {
+    const lifetime = renderedLifetime;
+    requireAccountWork(lifetime);
     if (!data) return;
+    setNotice("");
     try {
       if (!navigator.onLine) throw new TypeError("Offline");
-      await api(path, method, body);
-      await refresh();
-      setNotice("Saved. Another step forward.");
-    } catch (e) {
-      if (e instanceof TypeError && optimistic) {
-        enqueue(data.user.id, path, body, method);
+      // Replay earlier edits before a new write so reconnect cannot restore stale portions.
+      if (pending().some((item) => item.userId === data.user.id)) {
+        try {
+          await syncQueue(data.user.id, lifetime);
+        } finally {
+          if (isCurrentAccount(lifetime)) setQueueItems(pending());
+        }
+      }
+      requireAccountWork(lifetime);
+      if (pendingConflict(data.user.id, path, body, method)) {
+        if (!optimistic)
+          throw new Error(
+            "Resolve the earlier change to this record before saving.",
+          );
+        enqueue(data.user.id, path, body, method, lifetime);
         const next = optimistic(data);
         setData(next);
-        cacheSnapshot(next);
-        setQueued(pending().length);
+        cacheSnapshot(next, lifetime);
+        setQueueItems(pending());
+        setNotice(
+          "Saved on this device. Resolve the earlier change to this record to sync it.",
+        );
+        return;
+      }
+      await api(path, method, body, data.user.id, lifetime);
+    } catch (e) {
+      requireAccountWork(lifetime);
+      if (e instanceof TypeError && optimistic) {
+        enqueue(data.user.id, path, body, method, lifetime);
+        const next = optimistic(data);
+        setData(next);
+        cacheSnapshot(next, lifetime);
+        setQueueItems(pending());
         setNotice("Saved on this device. We’ll sync when you reconnect.");
-      } else throw e;
+        return;
+      }
+      throw e;
+    }
+    requireAccountWork(lifetime);
+    // A refresh/cache failure after a committed write must never queue that write again.
+    if (optimistic) {
+      const next = optimistic(data);
+      setData(next);
+      cacheSnapshot(next, lifetime);
+    }
+    setQueueItems(pending());
+    try {
+      await refresh(lifetime);
+      requireAccountWork(lifetime);
+      setNotice("Saved. You can correct it in your food diary.");
+    } catch (error) {
+      requireAccountWork(lifetime);
+      if (error instanceof StaleAccountError) throw error;
+      setNotice(
+        "Saved to your account, but the latest totals could not load. Reconnect or reload to refresh.",
+      );
     }
   }
+
   async function logFoods(logs: FoodLog[]) {
     await mutate("/logs", logs, "POST", (s) => ({
       ...s,
       logs: [...s.logs, ...logs],
     }));
+    requireAccountWork(renderedLifetime);
+    if (logs[0]) setDate(logs[0].date);
     setDialog(null);
   }
   async function saveWorkout(w: Workout) {
@@ -203,6 +493,7 @@ export default function App() {
       ...s,
       workouts: [...s.workouts, w],
     }));
+    requireAccountWork(renderedLifetime);
     setDialog(null);
   }
   function openFood(mode = "search", category = "Breakfast") {
@@ -210,21 +501,75 @@ export default function App() {
     setMeal(category);
     setDialog("food");
   }
+  function beginTransition() {
+    requireAccountWork(renderedLifetime);
+    const transition = beginAccountChange();
+    setRenderedLifetime(transition);
+    refreshRevision.current += 1;
+    recovering.current = false;
+    activeMutations.current.clear();
+    setSyncBusy(false);
+    setMutationBusy(false);
+    return transition;
+  }
+  function clearAccount() {
+    try {
+      clearLocal();
+    } catch (error) {
+      setNotice((error as Error).message);
+    }
+    setRenderedLifetime(accountLifetime());
+    setData(null);
+    setQueueItems([]);
+    setDialog(null);
+    setEditing(null);
+    setPage("home");
+  }
   async function logout() {
+    if (!isCurrentAccount(renderedLifetime) || renderedLifetime.changing)
+      return;
+    if (recovering.current) {
+      setNotice(
+        "Wait for the queued change to finish resolving before signing out.",
+      );
+      return;
+    }
     if (
-      pending().length &&
+      (pending().length ||
+        storageWarning().includes("Offline entries cannot be read")) &&
       !window.confirm(
-        "There are unsynced entries on this device. Signing out will discard them. Sign out anyway?",
+        "There are unsynced or unreadable entries on this device. Signing out will discard them. Sign out anyway?",
       )
     )
       return;
+    const transition = beginTransition();
     try {
-      await api("/auth/logout", "POST");
-      clearLocal();
-      setData(null);
-      setPage("home");
+      try {
+        await api("/auth/logout", "POST", undefined, data?.user.id, transition);
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 401)) throw error;
+      }
+      requireCurrentAccount(transition);
+      clearAccount();
     } catch (e) {
+      if (!isCurrentAccount(transition)) return;
+      setRenderedLifetime(startAccountLifetime(transition.userId));
       setNotice((e as Error).message);
+    }
+  }
+  async function deleteAccount(password: string) {
+    const transition = beginTransition();
+    try {
+      await api("/account", "DELETE", { password }, data?.user.id, transition);
+      requireCurrentAccount(transition);
+      clearAccount();
+    } catch (error) {
+      if (isCurrentAccount(transition)) {
+        setRenderedLifetime(startAccountLifetime(transition.userId));
+        // Resume effects and handlers under a new lifetime after a rejected deletion.
+        setNotice((error as Error).message);
+      }
+      throw error;
     }
   }
   const [authMode, setAuthMode] = useState("register"),
@@ -232,19 +577,35 @@ export default function App() {
     [authBusy, setAuthBusy] = useState(false);
   async function auth(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!isCurrentAccount(renderedLifetime) || renderedLifetime.changing)
+      return;
+    let lifetime = beginTransition();
     setAuthBusy(true);
     setAuthError("");
     const f = new FormData(e.currentTarget);
     try {
-      await api("/auth/" + authMode, "POST", {
-        email: f.get("email"),
-        password: f.get("password"),
-      });
-      await refresh();
+      const user = await api<{ id: string }>(
+        "/auth/" + authMode,
+        "POST",
+        {
+          email: f.get("email"),
+          password: f.get("password"),
+        },
+        undefined,
+        lifetime,
+      );
+      requireCurrentAccount(lifetime);
+      lifetime = commitAccountBoundary(user.id);
+      setRenderedLifetime(lifetime);
+      await refresh(lifetime);
     } catch (e) {
-      setAuthError((e as Error).message);
+      if (isCurrentAccount(lifetime)) {
+        lifetime = startAccountLifetime(lifetime.userId);
+        setRenderedLifetime(lifetime);
+        setAuthError((e as Error).message);
+      }
     } finally {
-      setAuthBusy(false);
+      if (isCurrentAccount(lifetime)) setAuthBusy(false);
     }
   }
   if (loading)
@@ -273,7 +634,7 @@ export default function App() {
               <em>Grow every day.</em>
             </h1>
             <p>
-              Your nutrition, training and progress. One place.
+              Build a stronger you.
               <br />
               Less guesswork. More good days.
             </p>
@@ -289,11 +650,11 @@ export default function App() {
               </span>
             </div>
           </div>
-          <small>TRACK LESS. UNDERSTAND MORE. PROGRESS CONSISTENTLY.</small>
+          <small>BUILD A STRONGER YOU</small>
         </div>
         <div className="auth-panel">
           <div className="logo-tile">
-            <img src="/brand.png" alt="BulkBro — Eat. Lift. Grow." />
+            <img src="/brand.png" alt="Bulk Bro — Build a stronger you" />
           </div>
           <h2>
             {authMode === "register"
@@ -353,6 +714,11 @@ export default function App() {
               ? "Already have an account? Sign in"
               : "New here? Create an account"}
           </button>
+          {storageWarning() && (
+            <p className="error" role="alert">
+              {storageWarning()}
+            </p>
+          )}
           <p className="privacy-note">
             Your health data is private. Nothing is shared publicly.
             <br />
@@ -382,8 +748,8 @@ export default function App() {
           </p>
           <ProfileForm
             onSave={async (p) => {
-              await api("/profile", "PUT", p);
-              await refresh();
+              await api("/profile", "PUT", p, data.user.id, renderedLifetime);
+              await refreshRenderedAccount();
             }}
           />
         </div>
@@ -413,10 +779,14 @@ export default function App() {
     },
     eaten = totals(dayLogs),
     remaining = targets.calories - eaten.calories,
-    loggingStreak = streak(data.logs.map((l) => l.date)),
+    streakInfo = mealStreak(
+      data.logs.map((l) => l.date),
+      clockDay,
+    ),
+    loggingStreak = streakInfo.current,
     weights = rollingWeights(data.weights),
     currentWeight = weights.at(-1)?.weight ?? p.weight;
-  const today = localDate(),
+  const today = clockDay,
     week = Array.from({ length: 7 }, (_, i) => offsetDate(date, i - 6)),
     chart = week.map((d) => ({
       date: d,
@@ -433,13 +803,6 @@ export default function App() {
       data.weights.length * 15 +
       data.activity.filter((a) => a.steps >= p.stepGoal).length * 30,
     level = Math.floor(xp / 250) + 1;
-  const score = Math.round(
-    ((Math.min(1, eaten.protein / targets.protein) +
-      Math.min(1, activity.steps / p.stepGoal) +
-      (dayLogs.length ? 1 : 0)) /
-      3) *
-      100,
-  );
   const summary = (
     <div className="section-heading">
       <div>
@@ -467,29 +830,101 @@ export default function App() {
                   : "Your goals, preferences and privacy."}
         </p>
       </div>
-      <div className="date-control">
-        <button
-          aria-label="Previous day"
-          onClick={() => setDate(offsetDate(date, -1))}
-        >
-          <ChevronLeft size={17} />
-        </button>
-        <input
-          aria-label="Selected date"
-          type="date"
-          value={date}
-          max={today}
-          onChange={(e) => e.target.value && setDate(e.target.value)}
-        />
-        <button
-          aria-label="Next day"
-          disabled={date >= today}
-          onClick={() => setDate(offsetDate(date, 1))}
-        >
-          <ChevronRight size={17} />
-        </button>
+      <div className="day-picker">
+        <div className="date-control">
+          <button
+            aria-label="Previous day"
+            onClick={() => setDate(offsetDate(date, -1))}
+          >
+            <ChevronLeft size={17} />
+          </button>
+          <input
+            aria-label="Selected date"
+            type="date"
+            value={date}
+            max={today}
+            onChange={(e) =>
+              e.target.value &&
+              e.target.value <= today &&
+              setDate(e.target.value)
+            }
+          />
+          <button
+            aria-label="Next day"
+            disabled={date >= today}
+            onClick={() => setDate(offsetDate(date, 1))}
+          >
+            <ChevronRight size={17} />
+          </button>
+        </div>
+        <small>
+          {date === today ? "Today" : "Historical day"} · {timezone}
+        </small>
+        {date !== today && (
+          <button className="text-button" onClick={() => setDate(today)}>
+            Back to today
+          </button>
+        )}
       </div>
     </div>
+  );
+  const diaryContext = (
+    <>
+      {(page === "home" || page === "food") && (
+        <section className="day-status" aria-label="Logging habit">
+          <div data-testid="day-completion">
+            <Check size={18} />
+            <span>
+              {dayLogs.length
+                ? "Daily check-in complete"
+                : "Your first meal starts the day"}
+              <small>
+                {date} ·{" "}
+                {dayLogs.length
+                  ? "A saved meal counts. No calorie target required."
+                  : "Nothing logged yet. Add breakfast, lunch, dinner or a snack."}
+              </small>
+            </span>
+          </div>
+          <div>
+            <strong data-testid="current-streak">{streakInfo.current}</strong>
+            <small>Current streak</small>
+          </div>
+          <div>
+            <strong data-testid="best-streak">{streakInfo.best}</strong>
+            <small>Best streak</small>
+          </div>
+        </section>
+      )}
+      {(page === "home" || page === "food") && (
+        <nav className="week-days" aria-label="Recent diary days">
+          {week.map((day) => (
+            <button
+              key={day}
+              className={day === date ? "selected" : ""}
+              aria-label={`View diary ${day}`}
+              aria-current={day === date ? "date" : undefined}
+              onClick={() => setDate(day)}
+            >
+              <span>
+                {new Date(day + "T12:00:00").toLocaleDateString(undefined, {
+                  weekday: "short",
+                })}
+              </span>
+              <strong>{Number(day.slice(-2))}</strong>
+              <small>
+                {data.logs.some((l) => l.date === day) ? "Logged" : "—"}
+              </small>
+            </button>
+          ))}
+        </nav>
+      )}
+      {date !== today && (page === "home" || page === "food") && (
+        <p className="muted history-note">
+          Historical food entries · compared with your current targets.
+        </p>
+      )}
+    </>
   );
   return (
     <div className="app-shell">
@@ -523,13 +958,6 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <button className="coach-nav" onClick={() => setDialog("coach")}>
-          <Sparkles size={20} />
-          <span>
-            Ask your coach<small>A little guidance goes a long way</small>
-          </span>
-          <ArrowUpRight size={16} />
-        </button>
         <div className="sidebar-bottom">
           <div className="level-card">
             <div>
@@ -609,21 +1037,16 @@ export default function App() {
           </div>
         </header>
         <main>
-          {queued > 0 && (
-            <div className="info">
-              {queued} entries waiting to sync.{" "}
-              <button
-                className="text-button"
-                onClick={() =>
-                  syncQueue(data.user.id)
-                    .then(refresh)
-                    .then(() => setQueued(pending().length))
-                    .catch((e) => setNotice(e.message))
-                }
-              >
-                Retry sync
-              </button>
-            </div>
+          <QueueRecovery
+            items={queueItems.filter((item) => item.userId === data.user.id)}
+            busy={syncBusy}
+            onRetry={(id) => recoverQueue("retry", id)}
+            onDiscard={(id) => recoverQueue("discard", id)}
+          />
+          {storageWarning() && (
+            <p className="error" role="alert">
+              {storageWarning()}
+            </p>
           )}
           {summary}
           {page === "home" && (
@@ -644,12 +1067,14 @@ export default function App() {
                     <div
                       className="calorie-ring"
                       style={{
-                        background: `conic-gradient(var(--lime) ${Math.min(100, (eaten.calories / targets.calories) * 100)}%, #30372b 0)`,
+                        background: `conic-gradient(var(--lime) ${Math.min(100, targets.calories > 0 ? (eaten.calories / targets.calories) * 100 : eaten.calories > 0 ? 100 : 0)}%, #30372b 0)`,
                       }}
                     >
                       <div>
                         <span className="ring-label">CALORIES EATEN</span>
-                        <strong>{fmt(eaten.calories)}</strong>
+                        <strong data-testid="consumed-calories">
+                          {fmt(eaten.calories)}
+                        </strong>
                         <span>of {fmt(targets.calories)} kcal</span>
                       </div>
                     </div>
@@ -658,11 +1083,11 @@ export default function App() {
                         <span className="lime-dot" />
                         <span>
                           {remaining >= 0
-                            ? "Still on the menu"
+                            ? "Calories remaining"
                             : "Above target"}
                         </span>
                       </div>
-                      <strong>
+                      <strong data-testid="remaining-calories">
                         {fmt(Math.abs(remaining))}
                         <small>kcal</small>
                       </strong>
@@ -687,7 +1112,8 @@ export default function App() {
                     </span>
                     <button
                       className="text-button"
-                      onClick={() => setDialog("profile")}
+                      onClick={() => setDialog("targets")}
+                      aria-label="Edit daily targets"
                     >
                       {fmt(targets.calories)} kcal <ArrowUpRight size={14} />
                     </button>
@@ -708,24 +1134,99 @@ export default function App() {
                             : key.charAt(0).toUpperCase() + key.slice(1)}
                         </strong>
                         <span>
-                          <b>{fmt(eaten[key])}</b> / {fmt(targets[key])} g
+                          <b data-testid={`consumed-${key}`}>
+                            {eaten[key].toFixed(1)}
+                          </b>{" "}
+                          / {targets[key].toFixed(1)} g
                         </span>
                       </div>
                       <Progress
                         value={eaten[key]}
                         max={targets[key]}
+                        label={key === "carbs" ? "Carbohydrates" : key}
                         color={
                           ["var(--lime)", "var(--purple)", "var(--orange)"][i]
                         }
                       />
                       <small>
-                        {fmt(Math.max(0, targets[key] - eaten[key]))} g
-                        remaining
+                        {Math.abs(targets[key] - eaten[key]).toFixed(1)} g{" "}
+                        {eaten[key] > targets[key]
+                          ? "over target"
+                          : "remaining"}
                       </small>
                     </div>
                   ))}
                   <div className="macro-note">
                     Consistency over perfection. You’ve got this.
+                  </div>
+                </section>
+              </div>
+              {diaryContext}
+              <div className="lower-grid">
+                <section className="card">
+                  <div className="card-heading">
+                    <div>
+                      <h2>On the menu</h2>
+                      <p className="muted">
+                        Meals for {date}, all in one place.
+                      </p>
+                    </div>
+                    <button
+                      className="text-button"
+                      onClick={() => setPage("food")}
+                    >
+                      View diary <ArrowRight size={16} />
+                    </button>
+                  </div>
+                  <MealList
+                    logs={dayLogs}
+                    onAdd={(m) => openFood("search", m)}
+                  />
+                </section>
+                <section className="card weekly-card">
+                  <div className="card-heading">
+                    <div>
+                      <span className="eyebrow">THE LONG GAME</span>
+                      <h2>Small wins. Real progress.</h2>
+                    </div>
+                    <ChartNoAxesCombined size={20} className="lime" />
+                  </div>
+                  <div className="weekly-weight">
+                    <strong>
+                      {currentWeight.toFixed(1)}
+                      <small>kg</small>
+                    </strong>
+                    <span>
+                      {weights.length >= 2
+                        ? `${weights.at(-1)!.average - weights[0].average >= 0 ? "+" : ""}${(weights.at(-1)!.average - weights[0].average).toFixed(1)} kg trend change`
+                        : "Your starting point"}
+                    </span>
+                  </div>
+                  {weights.length > 1 ? (
+                    <WeightChart data={weights.slice(-30)} />
+                  ) : (
+                    <div className="mini-empty">
+                      Your trend starts with a weigh-in.
+                      <br />A few entries make the picture clearer.
+                    </div>
+                  )}
+                  <div className="weekly-bottom">
+                    <div>
+                      <strong>
+                        {
+                          data.workouts.filter((w) => week.includes(w.date))
+                            .length
+                        }
+                      </strong>
+                      <span>sessions this week</span>
+                    </div>
+                    <button
+                      className="button secondary small"
+                      onClick={() => setDialog("weight")}
+                    >
+                      <Plus size={15} />
+                      Weigh in
+                    </button>
                   </div>
                 </section>
               </div>
@@ -808,72 +1309,6 @@ export default function App() {
                   <Plus size={17} />
                 </button>
               </div>
-              <div className="lower-grid">
-                <section className="card">
-                  <div className="card-heading">
-                    <div>
-                      <h2>On the menu</h2>
-                      <p className="muted">Today’s meals, all in one place.</p>
-                    </div>
-                    <button
-                      className="text-button"
-                      onClick={() => setPage("food")}
-                    >
-                      View diary <ArrowRight size={16} />
-                    </button>
-                  </div>
-                  <MealList
-                    logs={dayLogs}
-                    onAdd={(m) => openFood("search", m)}
-                  />
-                </section>
-                <section className="card weekly-card">
-                  <div className="card-heading">
-                    <div>
-                      <span className="eyebrow">THE LONG GAME</span>
-                      <h2>Small wins. Real progress.</h2>
-                    </div>
-                    <ChartNoAxesCombined size={20} className="lime" />
-                  </div>
-                  <div className="weekly-weight">
-                    <strong>
-                      {currentWeight.toFixed(1)}
-                      <small>kg</small>
-                    </strong>
-                    <span>
-                      {weights.length >= 2
-                        ? `${weights.at(-1)!.average - weights[0].average >= 0 ? "+" : ""}${(weights.at(-1)!.average - weights[0].average).toFixed(1)} kg trend change`
-                        : "Your starting point"}
-                    </span>
-                  </div>
-                  {weights.length > 1 ? (
-                    <WeightChart data={weights.slice(-30)} />
-                  ) : (
-                    <div className="mini-empty">
-                      Your trend starts with a weigh-in.
-                      <br />A few entries make the picture clearer.
-                    </div>
-                  )}
-                  <div className="weekly-bottom">
-                    <div>
-                      <strong>
-                        {
-                          data.workouts.filter((w) => week.includes(w.date))
-                            .length
-                        }
-                      </strong>
-                      <span>sessions this week</span>
-                    </div>
-                    <button
-                      className="button secondary small"
-                      onClick={() => setDialog("weight")}
-                    >
-                      <Plus size={15} />
-                      Weigh in
-                    </button>
-                  </div>
-                </section>
-              </div>
               <div className="consistency-banner">
                 <div className="activity-icon green">
                   <Flame size={24} />
@@ -882,13 +1317,15 @@ export default function App() {
                   <h3>Keep showing up for yourself.</h3>
                   <p>
                     {loggingStreak
-                      ? `${loggingStreak} days of food logging. That’s consistency in action.`
+                      ? `${loggingStreak} day${loggingStreak === 1 ? "" : "s"} of food logging. Best so far: ${streakInfo.best} day${streakInfo.best === 1 ? "" : "s"}.`
                       : "Your first log is the start of a stronger routine."}
                   </p>
                 </div>
-                <span>
-                  {score}%<small>daily consistency</small>
-                </span>
+                <small>
+                  One saved meal per local day counts.
+                  <br />
+                  Backfills and deletions recalculate your streak.
+                </small>
               </div>
             </>
           )}
@@ -899,31 +1336,27 @@ export default function App() {
                   <div className="card" key={k}>
                     <Stat
                       label={k}
-                      value={fmt(eaten[k])}
+                      value={
+                        k === "calories" ? fmt(eaten[k]) : eaten[k].toFixed(1)
+                      }
                       unit={`/ ${fmt(targets[k])} ${k === "calories" ? "kcal" : "g"}`}
                     />
-                    <Progress value={eaten[k]} max={targets[k]} />
+                    <Progress value={eaten[k]} max={targets[k]} label={k} />
+                    <small className="muted">
+                      {Math.abs(targets[k] - eaten[k]).toFixed(
+                        k === "calories" ? 0 : 1,
+                      )}{" "}
+                      {k === "calories" ? "kcal" : "g"}{" "}
+                      {eaten[k] > targets[k] ? "over target" : "remaining"}
+                    </small>
                   </div>
                 ))}
               </div>
+              {diaryContext}
               <div className="quick-actions">
                 <button className="button primary" onClick={() => openFood()}>
                   <Plus size={18} />
                   Add food
-                </button>
-                <button
-                  className="button secondary"
-                  onClick={() => openFood("ai")}
-                >
-                  <Camera size={18} />
-                  Scan meal
-                </button>
-                <button
-                  className="button secondary"
-                  onClick={() => openFood("barcode")}
-                >
-                  <ScanLine size={18} />
-                  Scan barcode
                 </button>
                 <button
                   className="button secondary"
@@ -934,12 +1367,14 @@ export default function App() {
                 </button>
                 <button
                   className="button secondary"
+                  disabled={mutationBusy}
                   onClick={async () => {
                     const yesterday = data.logs.filter(
                       (l) => l.date === offsetDate(date, -1),
                     );
                     if (!yesterday.length)
                       return setNotice("No food logged on the previous day.");
+                    setMutationBusy(true);
                     try {
                       await logFoods(
                         yesterday.map((l) => ({
@@ -950,7 +1385,11 @@ export default function App() {
                         })),
                       );
                     } catch (e) {
-                      setNotice((e as Error).message);
+                      if (isCurrentAccount(renderedLifetime))
+                        setNotice((e as Error).message);
+                    } finally {
+                      if (isCurrentAccount(renderedLifetime))
+                        setMutationBusy(false);
                     }
                   }}
                 >
@@ -972,13 +1411,51 @@ export default function App() {
                         kcal
                       </small>
                     </h2>
-                    <button
-                      className="text-button"
-                      onClick={() => openFood("search", m)}
-                    >
-                      <Plus size={17} />
-                      Add food
-                    </button>
+                    <div className="meal-actions">
+                      {!!dayLogs.filter((l) => l.meal === m).length && (
+                        <button
+                          className="text-button danger"
+                          disabled={mutationBusy}
+                          onClick={async () => {
+                            if (
+                              !window.confirm(
+                                `Delete every item in ${m} on ${date}?`,
+                              )
+                            )
+                              return;
+                            setMutationBusy(true);
+                            try {
+                              await mutate(
+                                `/logs?date=${date}&meal=${encodeURIComponent(m)}`,
+                                undefined,
+                                "DELETE",
+                                (s) => ({
+                                  ...s,
+                                  logs: s.logs.filter(
+                                    (l) => l.date !== date || l.meal !== m,
+                                  ),
+                                }),
+                              );
+                            } catch (e) {
+                              if (isCurrentAccount(renderedLifetime))
+                                setNotice((e as Error).message);
+                            } finally {
+                              if (isCurrentAccount(renderedLifetime))
+                                setMutationBusy(false);
+                            }
+                          }}
+                        >
+                          Delete meal
+                        </button>
+                      )}
+                      <button
+                        className="text-button"
+                        onClick={() => openFood("search", m)}
+                      >
+                        <Plus size={17} />
+                        Add food
+                      </button>
+                    </div>
                   </div>
                   {dayLogs.filter((l) => l.meal === m).length ? (
                     dayLogs
@@ -993,13 +1470,20 @@ export default function App() {
                             </small>
                           </div>
                           <span className="food-macros">
-                            P {fmt(l.protein)} · C {fmt(l.carbs)} · F{" "}
-                            {fmt(l.fat)}
+                            P {l.protein.toFixed(1)} g · C {l.carbs.toFixed(1)}{" "}
+                            g · F {l.fat.toFixed(1)} g
                           </span>
                           <strong>
                             {fmt(l.calories)}
                             <small> kcal</small>
                           </strong>
+                          <button
+                            className="icon-button"
+                            aria-label={"Edit " + l.name}
+                            onClick={() => setEditing(l)}
+                          >
+                            <Pencil size={16} />
+                          </button>
                           <button
                             className="icon-button"
                             aria-label={"Delete " + l.name}
@@ -1008,7 +1492,16 @@ export default function App() {
                                 "/logs/" + l.id,
                                 undefined,
                                 "DELETE",
-                              ).catch((e) => setNotice(e.message))
+                                (s) => ({
+                                  ...s,
+                                  logs: s.logs.filter(
+                                    (entry) => entry.id !== l.id,
+                                  ),
+                                }),
+                              ).catch((e) => {
+                                if (isCurrentAccount(renderedLifetime))
+                                  setNotice(e.message);
+                              })
                             }
                           >
                             <Trash2 size={16} />
@@ -1178,8 +1671,11 @@ export default function App() {
                   profile or social sharing is enabled.
                 </p>
                 <p className="muted">
-                  Recent records are cached on this device for offline use.
-                  Signing out clears the cache and pending entries.
+                  Records are saved to your private account on this running
+                  server. Other devices need to connect to this same server and
+                  sign in; there is no cloud service configured. Recent records
+                  are cached on this device for offline use. Signing out clears
+                  the cache and pending entries.
                 </p>
                 <div className="stack">
                   <a
@@ -1194,12 +1690,7 @@ export default function App() {
                     <LogOut size={18} />
                     Sign out
                   </button>
-                  <DeleteAccount
-                    onDeleted={() => {
-                      clearLocal();
-                      setData(null);
-                    }}
-                  />
+                  <DeleteAccount onDelete={deleteAccount} />
                 </div>
               </section>
               <section className="card">
@@ -1220,8 +1711,10 @@ export default function App() {
                 <h2>About your estimates</h2>
                 <p className="muted">
                   Calorie targets use Mifflin–St Jeor with an activity
-                  multiplier. Food database and image estimates can vary; review
-                  portions and labels. Exercise energy is always an estimate.
+                  multiplier. Use nutrition labels for your custom foods and
+                  review portions. Calories display as whole kcal and macros as
+                  0.1 g; calculations retain precision. Exercise energy is
+                  always an estimate.
                 </p>
                 <p className="muted">
                   Major dietary changes are worth discussing with a qualified
@@ -1229,15 +1722,15 @@ export default function App() {
                   under-18s.
                 </p>
                 <small>
-                  Food data: Open Food Facts · Open Database License. USDA
-                  FoodData Central when configured.
+                  Photo scanning and AI coaching are deferred. Manual tracking
+                  needs no paid API or food catalogue.
                 </small>
               </section>
             </div>
           )}
           <footer className="page-footer">
             <span>
-              {BRAND.toUpperCase()} <b> / </b> EAT. LIFT. GROW.
+              {BRAND.toUpperCase()} <b> / </b> Build a stronger you
             </span>
             <span>Progress consistently. Live fully.</span>
           </footer>
@@ -1251,7 +1744,7 @@ export default function App() {
           mode={foodMode}
           onClose={() => setDialog(null)}
           onSave={logFoods}
-          onRefresh={refresh}
+          onRefresh={refreshRenderedAccount}
         />
       )}
       {dialog === "workout" && (
@@ -1272,6 +1765,7 @@ export default function App() {
             initial={p}
             onSave={async (profile) => {
               await mutate("/profile", profile, "PUT");
+              requireAccountWork(renderedLifetime);
               setDialog(null);
             }}
           />
@@ -1288,6 +1782,7 @@ export default function App() {
               ...s,
               weights: [...s.weights.filter((x) => x.date !== w.date), w],
             }));
+            requireAccountWork(renderedLifetime);
             setDialog(null);
           }}
         />
@@ -1301,14 +1796,44 @@ export default function App() {
               ...s,
               activity: [...s.activity.filter((x) => x.date !== a.date), a],
             }));
+            requireAccountWork(renderedLifetime);
             setDialog(null);
           }}
         />
       )}
-      {dialog === "coach" && <CoachDialog onClose={() => setDialog(null)} />}
+      {editing && (
+        <EditFoodDialog
+          entry={editing}
+          meals={Array.from(
+            new Set([...mealNames, ...data.logs.map((l) => l.meal)]),
+          )}
+          onClose={() => setEditing(null)}
+          onSave={async (entry) => {
+            await mutate("/logs/" + entry.id, entry, "PUT", (s) => ({
+              ...s,
+              logs: s.logs.map((l) => (l.id === entry.id ? entry : l)),
+            }));
+            requireAccountWork(renderedLifetime);
+            setEditing(null);
+          }}
+        />
+      )}
+      {dialog === "targets" && (
+        <TargetsDialog
+          targets={baseTargets}
+          onClose={() => setDialog(null)}
+          onSave={async (targets) => {
+            await mutate("/profile", { ...p, targets }, "PUT", (s) => ({
+              ...s,
+              profile: { ...p, targets },
+            }));
+            requireAccountWork(renderedLifetime);
+            setDialog(null);
+          }}
+        />
+      )}
       {notice && (
         <div className="toast" role="status">
-          <Check size={17} />
           {notice}
           <button
             aria-label="Dismiss notification"
@@ -1474,6 +1999,50 @@ function ProgressHub({
           />
         </div>
       </div>
+      <section className="card">
+        <div className="card-heading">
+          <h2>Seven-day food history</h2>
+          <small className="muted">Ending {date}</small>
+        </div>
+        <p className="muted">
+          Current calorie target:{" "}
+          {fmt(p.targets?.calories ?? calculateTargets(p).targets.calories)}{" "}
+          kcal. Empty days mean no record, not zero intake.
+        </p>
+        <div className="history-scroll">
+          <table className="history-table">
+            <thead>
+              <tr>
+                <th scope="col">Day</th>
+                <th scope="col">kcal</th>
+                <th scope="col">Protein (g)</th>
+                <th scope="col">Carbs (g)</th>
+                <th scope="col">Fat (g)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {days.map((day) => {
+                const entries = logs.filter((l) => l.date === day);
+                const total = totals(entries);
+                return (
+                  <tr key={day}>
+                    <th scope="row">{day}</th>
+                    {(["calories", "protein", "carbs", "fat"] as const).map(
+                      (key) => (
+                        <td key={key}>
+                          {entries.length
+                            ? total[key].toFixed(key === "calories" ? 0 : 1)
+                            : "—"}
+                        </td>
+                      ),
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
       <section className="card">
         <div className="card-heading">
           <div>
@@ -1770,69 +2339,11 @@ function ActivityDialog({
     </Modal>
   );
 }
-function CoachDialog({ onClose }: { onClose: () => void }) {
-  const [question, setQuestion] = useState(""),
-    [answer, setAnswer] = useState(""),
-    [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
-  return (
-    <Modal title="A little guidance" onClose={onClose}>
-      <p className="muted">
-        Your coach uses your logged nutrition, training and progress. Your
-        relevant records are sent to OpenAI only when you ask.
-      </p>
-      <div className="suggestions">
-        {[
-          "How much protein do I still need?",
-          "Summarise my training progress",
-          "How consistent was my food logging?",
-        ].map((q) => (
-          <button className="chip" key={q} onClick={() => setQuestion(q)}>
-            {q}
-          </button>
-        ))}
-      </div>
-      <form
-        onSubmit={async (e) => {
-          e.preventDefault();
-          setBusy(true);
-          setError("");
-          try {
-            const r = await api<{ answer: string }>("/ai/coach", "POST", {
-              question: question + " (Today is " + localDate() + ".)",
-            });
-            setAnswer(r.answer);
-          } catch (e) {
-            setError((e as Error).message);
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Field label="Ask your coach">
-          <textarea
-            value={question}
-            maxLength={900}
-            onChange={(e) => setQuestion(e.target.value)}
-            required
-            placeholder="What does my progress look like?"
-          />
-        </Field>
-        <button disabled={busy} className="button primary">
-          {busy ? "Looking at your logs…" : "Ask coach"}
-          <Sparkles size={17} />
-        </button>
-      </form>
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
-      {answer && <div className="coach-answer">{answer}</div>}
-    </Modal>
-  );
-}
-function DeleteAccount({ onDeleted }: { onDeleted: () => void }) {
+function DeleteAccount({
+  onDelete,
+}: {
+  onDelete: (password: string) => Promise<void>;
+}) {
   const [open, setOpen] = useState(false),
     [error, setError] = useState("");
   return (
@@ -1851,10 +2362,7 @@ function DeleteAccount({ onDeleted }: { onDeleted: () => void }) {
               e.preventDefault();
               const f = new FormData(e.currentTarget);
               try {
-                await api("/account", "DELETE", {
-                  password: f.get("password"),
-                });
-                onDeleted();
+                await onDelete(String(f.get("password")));
               } catch (e) {
                 setError((e as Error).message);
               }

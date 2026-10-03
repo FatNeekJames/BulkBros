@@ -21,6 +21,7 @@ export function Modal({
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
   useEffect(() => {
     ref.current?.showModal();
     return () => ref.current?.close();
@@ -28,11 +29,12 @@ export function Modal({
   return (
     <dialog
       ref={ref}
+      aria-labelledby={titleId}
       className={wide ? "modal wide" : "modal"}
       onCancel={onClose}
     >
       <div className="modal-head">
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <button
           className="icon-button"
           onClick={onClose}
@@ -94,22 +96,29 @@ export function Progress({
   value,
   max,
   color = "var(--lime)",
+  label = "Progress toward target",
 }: {
   value: number;
   max: number;
   color?: string;
+  label?: string;
 }) {
   return (
     <div
       className="progress"
       role="progressbar"
-      aria-valuenow={Math.round(value)}
+      aria-label={label}
+      aria-valuenow={Math.max(
+        0,
+        Math.min(100, max > 0 ? (value / max) * 100 : value > 0 ? 100 : 0),
+      )}
       aria-valuemin={0}
-      aria-valuemax={Math.max(max, value)}
+      aria-valuemax={100}
+      aria-valuetext={`${Math.round(value * 10) / 10} of ${Math.round(max * 10) / 10}${value > max ? ", over target" : ""}`}
     >
       <span
         style={{
-          width: `${Math.min(100, max > 0 ? (value / max) * 100 : 0)}%`,
+          width: `${Math.max(0, Math.min(100, max > 0 ? (value / max) * 100 : value > 0 ? 100 : 0))}%`,
           background: color,
         }}
       />

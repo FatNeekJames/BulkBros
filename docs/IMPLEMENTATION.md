@@ -1,45 +1,81 @@
-# Brief review and release status
+# Daily tracking implementation review
 
-The source brief describes a six-phase product, including future social features. The current delivery is a working local web MVP spanning core foundation, nutrition, training and engagement. It is **not a finished production mobile platform**. There was no existing project to review or repair.
+Bulk Bro — **Build a stronger you** — was an existing React/TypeScript/Vite app with an Express API, SQLite database, authenticated accounts, Capacitor wrappers, and unit/API/browser/PWA checks. The work extends that app and keeps its green interface and plate/doughnut brand direction. It does not replace the database or seed user activity.
 
-| Brief area | Implementation status |
-|---|---|
-| Brand / premium dark interface / dashboard | Implemented with supplied artwork, configurable name, responsive desktop/mobile layout, real empty states |
-| Email account / profile / onboarding | Implemented for adults; OAuth, verification and password recovery remain |
-| BMR / TDEE / calorie targets | Implemented; manual target override and estimate explanation |
-| Macro calculator | Implemented in grams and percentages with consistent energy math |
-| Manual food, search, favourites, recents | Implemented with real Open Food Facts calls and private custom foods |
-| Barcode | Lookup and supported-browser camera; native scanning not built |
-| AI meal recognition and correction | Server integration, structured parsing, database candidate review, original/corrected storage implemented; live generation blocked by provider credit balance |
-| Recipes and saved meals | Implemented with ingredient quantities and per-portion calculations |
-| Copy meals | Previous-day copy and date-selected logging implemented; dedicated arbitrary-day bulk copy UI remains |
-| Steps / water / activity | Manual entry implemented; Apple Health and Health Connect not built |
-| Workouts / templates / custom routines | Implemented, including reuse of previous sessions and optional RPE |
-| History / volume / PRs | Implemented; dedicated exercise progression charts and PR notification animations remain |
-| Bodyweight / rolling charts | Implemented; displays metric charts even when imperial entry is selected |
-| Adaptive targets | No automatic changes; dedicated conservative suggestion engine remains |
-| Streaks / achievements / XP | Food logging streak, seven achievement types and basic levels implemented; expanded categories, streak protection and unlock animations remain |
-| Consistency score | Transparent simple food-log/protein/steps score; comprehensive weighted score remains |
-| Progress / weekly review | Weight trend, weekly calories, logged-day averages, steps, workout counts and PR list implemented; monthly, macro-adherence and strength analytics remain |
-| AI coach | Structured-data backend and UI implemented; live generation blocked by API credits |
-| Filtered meal recommendation engine | Not implemented |
-| Social feed / profiles / reactions / moderation | Deferred as requested future phase; no public sharing exists |
-| Privacy / export / account deletion | Implemented, default private; formal retention policy and privacy/legal review remain |
-| Notifications | Not implemented; no permissions or reminders are requested |
-| Offline | Durable queue, cache and idempotent replay implemented; multi-device conflict UI and encrypted storage remain |
-| Accessibility | Semantic forms, keyboard focus, modal dialog, high-contrast controls, reduced-motion CSS; full assistive-technology audit remains |
-| Technology / relational database | React/TypeScript/Express/SQLite local MVP; native clients and PostgreSQL migration remain |
-| Tests | Unit, API, relational persistence and browser workflows implemented; load tests, native device tests and live AI success verification remain |
+The review traced registration/setup, manual meal entry, persistence/reload, and the existing nutrition, training, progress and settings screens. These screens use in-app React navigation, with `/api` endpoints handled by Express. Development/build commands are in the [README](../README.md).
 
-## Next release gates
+## Requested feature assessment
 
-1. Add API credit to the selected OpenAI project, then verify real meal photos (multiple foods, hidden oils, no-food images, refusal and provider failures). Verify USDA matching with a separately provisioned key if generic cooked food coverage is required.
-2. Choose mobile packaging and implement HealthKit/Health Connect with explicit permission, revocation, and duplicate-energy reconciliation. Validate real devices and app-store requirements.
-3. Complete production account lifecycle (email verification/recovery, OAuth, session rotation/device management), migrations/PostgreSQL, backups/restores, monitoring and shared rate limiting.
-4. Obtain a nutrition/privacy/accessibility review, add data retention controls, and test screen readers and large text.
-5. Complete expanded analytics, recommendation filters, notifications and multi-device conflict handling before describing the whole original specification as complete.
-6. Introduce social only after explicit per-metric sharing controls, moderation, reporting and blocking are implemented and tested.
+“Before” describes the inspected source at the start of this pass. “Now” describes the implemented scope; test evidence is recorded separately after final validation.
 
-## Operational limits
+| Requested feature                                  | Before                                                                                                                    | Now                                                                                                                                     |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual meal logging and standard/custom meal names | Working, with several competing scanning/search entry points                                                              | Working; manual-first source picker and compact portion review                                                                          |
+| Explicit nutrition per 100 g or per serving        | Partial; generic amount/unit inputs did not clearly distinguish label basis from amount eaten                             | Working; explicit basis, quantity and conversion examples; no assumed grams per serving                                                 |
+| Private custom food definitions                    | Partial; separate save action was easy to skip                                                                            | Working; created foods save to the account when connected; failed library save retains the portion draft                                |
+| Food search, recents and favourites                | Partial; search depended on an external catalogue and could stall                                                         | Working within private saved foods/recent portions; favourites toggle; no external search required                                      |
+| Reusable meals and recipes                         | Working                                                                                                                   | Preserved; one-portion review plus repeats of previous date/meal groups                                                                 |
+| Correct already saved portions/nutrition           | Absent for persisted food entries                                                                                         | Working; owner-scoped updates recalculate diary/dashboard totals                                                                        |
+| Delete food item or complete meal                  | Partial; individual delete existed, whole-meal correction was incomplete                                                  | Working; individual and whole-meal removal recalculate totals                                                                           |
+| Calories/macros against editable targets           | Working but incomplete remaining/over-target detail                                                                       | Working; units, numerical consumed/remaining/over values and clamped progress graphics                                                  |
+| Age/body measurements/activity/goal setup          | Working                                                                                                                   | Preserved; estimated targets labelled and editable manual targets available                                                             |
+| Selected day and historical navigation             | Partial; date navigation existed, timezone and rollover rules were unclear                                                | Working; selected date, device timezone, historical/current-target explanation and seven-day diary                                      |
+| Current and best meal streak, day completion       | Partial; current streak existed, best/completion and correction rules incomplete                                          | Working; current/best derived from saved dates, explicit completion, no seeded activity                                                 |
+| Durable accounts/database                          | Working                                                                                                                   | Preserved; existing private SQLite records survive reload/restart                                                                       |
+| Owner separation and account lifecycle checks      | Partial; basic query scoping existed, correction/favourite edge cases and stale-client writes needed coverage             | Hardened owner checks and expected-account guards; separate-user tests cover records, targets, favourites/search, export and logout     |
+| Honest failed saves/offline storage                | Broken in edge cases; malformed storage could look empty and committed writes could be queued again after refresh failure | Validated cache/queue; blocked persistence prevents a false success; committed writes are not requeued for a failed refresh             |
+| JSON export / restore                              | Export working; restore absent                                                                                            | Account export preserved; operational SQLite backup/restore documented; no JSON import UI                                               |
+| Phone and keyboard usability                       | Partial; usable responsive base, tiny food details and crowded workflow                                                   | Focused quantity review, labelled controls, reduced picker clutter and improved phone controls; full assistive-technology audit remains |
+| Daily/weekly history and goal trends               | Partial; weekly calories/bodyweight chart existed                                                                         | Seven-day food totals added; bodyweight trends preserved; historical target versions/trends remain absent                               |
+| Achievements                                       | Working basic achievements, streak milestone used current streak only                                                     | Retained; meal milestones use actual logged dates/best run so normal missed days do not erase earned history                            |
+| Manual workouts/steps and energy separation        | Working manual entry; device import absent                                                                                | Preserved; manual workout/browser coverage, distinct energy, all-inclusive active energy replaces workout estimate                      |
+| Private 2–3-friend trial                           | Absent                                                                                                                    | Prepared protocol and feedback template; no invitations sent or real participants tested                                                |
+| AI scanning/coaching, social feed, subscriptions   | AI paths existed; social/payments absent                                                                                  | AI UI removed/deferred, AI endpoints return `410 AI_DEFERRED` without a provider call; no social or subscription additions              |
 
-The app's DB and browser cache contain private fitness records. Run locally on a trusted device. The current server is intentionally single-instance. Logarithmic growth/load behavior and incident recovery have not been tested. No public deployment or store submission was performed.
+## Nutrition and correction policy
+
+Foods contain their own calorie/protein/carbohydrate/fat nutrition snapshot. New definitions use either 100 g or one label serving as their basis. Quantity scaling uses `amount / basis amount`. Thus 200 kcal per 100 g gives 300 kcal for 150 g and 400 kcal for 200 g; 200 kcal per serving gives 300 kcal for 1.5 servings. Protein, carbohydrate, fat and optional fibre use the same ratio.
+
+Calories display to the nearest kcal; macros display to 0.1 g. Supported portion inputs start at 0.1. The correction form accepts full stored fractional precision, including recipe portions such as 100 g divided by three; changing the name, meal or date does not round the saved nutrition. Arithmetic retains unrounded values and scales from a stable nutrition basis while reviewing a draft. Label calories are retained even if 4/4/9 macro math differs because of label precision or fibre. A serving does not automatically convert to grams: that would require an explicit known serving weight, which this release does not collect.
+
+Adding a draft does not count it towards the day until **Log meal** succeeds on the server or is durably queued on this device. A food-definition save is distinguished from logging its portion. Empty/invalid quantities prevent logging. Corrections keep the food's saved identity and update the selected date/meal and nutrition; removing the last item leaves an honest empty meal/day. Retry IDs are stable so a lost response does not create a second food log.
+
+Changing a target updates comparison/progress, not any saved food's nutrition. Historical screens explicitly compare historical foods against **current targets**. Target history and historical adherence against the target in effect at the time are not implemented.
+
+## Calendar and streak policy
+
+- A completed day has at least one saved food in a meal on that date. Calorie or macro target attainment is irrelevant.
+- Current streak ends today when today contains food, otherwise yesterday. This gives an unfinished today time to be logged. A missed yesterday breaks the current run.
+- Best streak is the longest consecutive run among remaining logged dates up to today. Duplicate items on one day count once. Future-dated entries never inflate current/best streak or meal milestones.
+- Backfilling a gap can connect a run. Deleting a day's only food removes that day and recalculates both current and best streak. Food milestones therefore reflect remaining records rather than a separate permanent badge counter.
+- Calendar dates use `YYYY-MM-DD`. Day offsets use calendar arithmetic independent of DST, and “today” uses the device's current timezone. The displayed timezone is refreshed while the app is open and when it regains focus.
+- Existing entry dates stay as logged when travelling or changing device timezone. Only “today” and the current-run anchor change; no diary is silently redistributed between dates.
+- A view of today follows the next local day at midnight when no entry/edit dialog is open. An open draft keeps its chosen date. A historical view stays pinned. Use **Back to today** to return after reviewing a historical date or keeping a draft across midnight.
+
+Streak values are derived from the account's food logs after reload. There is no separately incremented counter, sample history or target-dependent streak inflation.
+
+## Persistence and account boundaries
+
+The server is the durable record store, not browser localStorage. The default SQLite file is `data/bulkbro.sqlite`, with foreign keys and WAL enabled. Users have independent profiles, food definitions, diary entries, saved meals, favourites, activity and training. Authenticated queries and updates use the server session's owner, and mutating client calls send the expected account so another tab changing sessions cannot silently write a draft into a different account.
+
+The device cache/queue is unencrypted. Supported offline food changes, target edits, workouts, bodyweight and activity updates are labelled pending until synced. Definitions, favourites and reusable recipes need a connection. Cached/offline records are validated; malformed storage is preserved with a warning rather than treated as an empty diary. If a queued write cannot be stored, the form remains with an error and no success toast. A successful server write followed by a failed refresh is reported as saved with stale totals, rather than retried as a new write.
+
+Signing out revokes the active server session and clears cached data, open account drafts and queued changes; unsynced entries require confirmation before discarding. Sync/export concern the active account. Export contains only committed server records, so finish syncing before exporting. There is no JSON import screen. [SQLite backup/restore](ARCHITECTURE.md#backups-and-restore) protects server data independently.
+
+Two devices need the same running server and their own sign-in. There is no hosted cloud backend or live push synchronization. Permanent offline replay rejections appear in a per-item recovery panel: retry or discard a selected local change while unrelated entries continue saving. Changes dependent on an unresolved record remain queued. Discard requires a fresh account snapshot and retains every other pending change. Reload fetches current server state; concurrent successful edits still resolve in write order, without version comparison or automatic merging.
+
+## Remaining work
+
+Core manual logging is implemented for this local account-backed release. Remaining P1 release verification is the prepared human phone trial and broader keyboard/screen-reader/large-text/device coverage. Hosting and an operational backup/restore rehearsal are needed before friends rely on a remotely available server; native packaging alone does not provide that server.
+
+P2 and operational follow-up:
+
+- Run [the 2–3-friend protocol](FRIEND_TEST.md), fix repeated confusion, then rerun the affected daily loop. No real friend trial has happened yet.
+- Deploy a private HTTPS server with backups, restore verification and monitoring; introduce schema migrations before structural database changes. The current runtime is a single server instance.
+- Add account recovery/email verification and a session/device management flow before wider distribution. These are absent today.
+- Add target history if users need meaningful long-term goal/adherence trends; current history deliberately shows current-target comparison.
+- Add JSON import only with reviewed ownership, validation and duplicate-handling behavior.
+- Implement HealthKit/Health Connect only after the daily loop trial, with permissions, revocation and activity de-duplication. No import permission is requested now.
+- Assess concurrent edits and encrypted native storage before promising robust cross-device offline merging.
+
+AI/photo scanning, AI coaching, huge food catalogues, social posting and subscriptions remain outside this pass. Existing legacy AI/analysis storage is preserved for compatibility; the active AI endpoints do not call a provider.
